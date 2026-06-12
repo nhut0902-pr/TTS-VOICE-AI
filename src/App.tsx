@@ -531,7 +531,7 @@ export default function App() {
                   setText(e.target.value);
                   setErrorText(null);
                 }}
-                maxLength={2000}
+                maxLength={30000}
                 placeholder="Compose script text to transform..."
                 rows={7}
                 className="w-full text-xs placeholder-gray-400 bg-transparent border-0 focus:ring-0 focus:outline-hidden leading-relaxed font-sans scrollbar-thin text-gray-800"
@@ -542,7 +542,7 @@ export default function App() {
                   💾 Drag & drop text/markdown file directly to load
                 </span>
                 <span>
-                  {textWordsCount} Words &nbsp;•&nbsp; {textCharsCount} / 2000 Characters
+                  {textWordsCount} Words &nbsp;•&nbsp; {textCharsCount} / 30000 Characters
                 </span>
               </div>
             </div>

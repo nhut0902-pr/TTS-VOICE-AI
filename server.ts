@@ -25,7 +25,58 @@ app.use((req, res, next) => {
 });
 
 // 1. API PROXY ENDPOINT
-// Proxies requests to tts-voice-ai.onrender.com with GET method to completely bypass CORS / connection errors
+// Helper to split long text into safe-sized chunks of characters
+function splitTextIntoChunks(text: string, maxLen = 250): string[] {
+  const paragraphs = text.split(/\n+/);
+  const chunks: string[] = [];
+
+  for (const paragraph of paragraphs) {
+    if (!paragraph.trim()) continue;
+
+    // Split by sentence-closing punctuation while keeping punctuation, matching Unicode-friendly chars
+    const sentenceRegex = /([^.!?\n\u3002\uff01\uff1f]+[.!?\n\u3002\uff01\uff1f]*)/g;
+    const matches = paragraph.match(sentenceRegex) || [paragraph];
+    
+    let currentChunk = '';
+
+    for (let sentence of matches) {
+      sentence = sentence.trim();
+      if (!sentence) continue;
+
+      if (currentChunk.length + sentence.length + 1 <= maxLen) {
+        currentChunk = currentChunk ? currentChunk + ' ' + sentence : sentence;
+      } else {
+        if (currentChunk) {
+          chunks.push(currentChunk);
+        }
+        
+        // Split extra-long sentences by words or spaces Safely
+        if (sentence.length > maxLen) {
+          const words = sentence.split(/\s+/);
+          let wordChunk = '';
+          for (const word of words) {
+            if (wordChunk.length + word.length + 1 <= maxLen) {
+              wordChunk = wordChunk ? wordChunk + ' ' + word : word;
+            } else {
+              if (wordChunk) chunks.push(wordChunk);
+              wordChunk = word;
+            }
+          }
+          currentChunk = wordChunk;
+        } else {
+          currentChunk = sentence;
+        }
+      }
+    }
+    if (currentChunk) {
+      chunks.push(currentChunk);
+    }
+  }
+
+  return chunks;
+}
+
+// Proxies requests to tts-voice-ai.onrender.com with GET method, chunking long text to bypass length limits & truncation
 app.post('/api/synthesize', async (req, res) => {
   const { text, voice } = req.body;
 
@@ -34,69 +85,101 @@ app.post('/api/synthesize', async (req, res) => {
     return;
   }
 
-  const encodedText = encodeURIComponent(text);
-  const ttsUrl = `https://tts-voice-ai.onrender.com/tts?text=${encodedText}&voice=${voice}`;
+  // 1. Split text into safe, optimal chunks to avoid silent upstream truncation / URI limits
+  const chunks = splitTextIntoChunks(text, 250);
+  console.log(`[TTS Chunking] Input text split into ${chunks.length} chunks. Voice: ${voice}`);
 
-  console.log(`TTS REQUEST URL: ${ttsUrl}`);
+  const buffers: Buffer[] = new Array(chunks.length);
+  let globalError: any = null;
 
-  let lastError: any = null;
+  // 2. Fetch a single chunk with retry mechanism
+  const fetchChunkWithRetry = async (index: number): Promise<void> => {
+    const chunk = chunks[index];
+    const encodedText = encodeURIComponent(chunk);
+    const ttsUrl = `https://tts-voice-ai.onrender.com/tts?text=${encodedText}&voice=${voice}`;
 
-  // Retry loop with 3 attempts to handle Render cold-starts gracefully (sleep mode)
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 seconds timeout per attempt
+    console.log(`[Express Proxy Chunk ${index + 1}/${chunks.length}] Target: ${ttsUrl}`);
 
-    try {
-      console.log(`[Express Proxy Attempt ${attempt}] GET: ${ttsUrl}`);
-      const apiResponse = await fetch(ttsUrl, {
-        method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AudenVoiceStudio/1.0'
-        },
-        signal: controller.signal
-      });
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout per chunk attempt
 
-      clearTimeout(timeoutId);
+      try {
+        const apiResponse = await fetch(ttsUrl, {
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AudenVoiceStudio/1.0'
+          },
+          signal: controller.signal
+        });
 
-      const contentType = apiResponse.headers.get('content-type') || '';
-      console.log(`[Express Proxy Response] Status: ${apiResponse.status}, Content-Type: ${contentType}`);
+        clearTimeout(timeoutId);
 
-      if (apiResponse.status === 200) {
-        if (!contentType.includes('audio')) {
-          if (contentType.includes('application/json')) {
-            const jsonData = await apiResponse.json();
-            throw new Error(jsonData.error || jsonData.message || 'JSON returned from backend.');
+        const contentType = apiResponse.headers.get('content-type') || '';
+
+        if (apiResponse.status === 200) {
+          if (!contentType.includes('audio')) {
+            if (contentType.includes('application/json')) {
+              const jsonData = await apiResponse.json();
+              throw new Error(jsonData.error || jsonData.message || 'JSON returned instead of audio.');
+            }
+            const txt = await apiResponse.text().catch(() => '');
+            throw new Error(`Invalid content-type from upstream: ${contentType}. Info: ${txt.slice(0, 100)}`);
           }
-          const txt = await apiResponse.text().catch(() => '');
-          throw new Error(`Invalid content-type from upstream: ${contentType}. Info: ${txt.slice(0, 100)}`);
-        }
 
-        const arrayBuf = await apiResponse.arrayBuffer();
-        const buffer = Buffer.from(arrayBuf);
-        res.setHeader('Content-Type', 'audio/mpeg');
-        res.setHeader('Content-Length', buffer.length);
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.send(buffer);
-        return;
-      } else {
-        const textSample = await apiResponse.text().catch(() => '');
-        if (textSample.includes('suspended') || textSample.includes('sleeping') || textSample.includes('Spin up') || apiResponse.status === 503) {
-          throw new Error(`Upstream TTS is currently boot-looping or sleeping on Render.com free tier (status ${apiResponse.status}).`);
+          const arrayBuf = await apiResponse.arrayBuffer();
+          buffers[index] = Buffer.from(arrayBuf);
+          console.log(`[Express Proxy Chunk ${index + 1}/${chunks.length}] Success! Size: ${buffers[index].length} bytes`);
+          return; // Success, stop retries for this chunk
+        } else {
+          const textSample = await apiResponse.text().catch(() => '');
+          if (textSample.includes('suspended') || textSample.includes('sleeping') || textSample.includes('Spin up') || apiResponse.status === 503) {
+            throw new Error(`Upstream TTS is currently sleeping on Render.com (status ${apiResponse.status}).`);
+          }
+          throw new Error(`Upstream returned error status ${apiResponse.status}: ${textSample.slice(0, 150)}`);
         }
-        throw new Error(`Upstream returned error status ${apiResponse.status}: ${textSample.slice(0, 150)}`);
-      }
-    } catch (err: any) {
-      clearTimeout(timeoutId);
-      lastError = err;
-      console.error(`[Express Proxy Attempt ${attempt} Error]:`, err.message || err);
-      // Wait before retry
-      if (attempt < 3) {
-        await new Promise(resolve => setTimeout(resolve, 2500));
+      } catch (err: any) {
+        clearTimeout(timeoutId);
+        console.error(`[Express Proxy Chunk ${index + 1}/${chunks.length} Attempt ${attempt} Error]:`, err.message || err);
+        
+        if (attempt === 3) {
+          throw err;
+        }
+        // Wait before next retry for this chunk (Render recovery delay)
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
-  }
+  };
 
-  res.status(502).json({ error: lastError?.message || 'Upstream speech server was unreachable after 3 retries' });
+  try {
+    // 3. Process fetching concurrently (up to 3 parallel workers) to keep performance fast while avoiding rate limits
+    const activeIndexes = [...Array(chunks.length).keys()];
+    const queueWorker = async () => {
+      while (activeIndexes.length > 0) {
+        const idx = activeIndexes.shift();
+        if (idx !== undefined) {
+          await fetchChunkWithRetry(idx);
+        }
+      }
+    };
+
+    // Spin up 3 concurrent workers
+    const workersCount = Math.min(3, chunks.length);
+    const workers = Array(workersCount).fill(null).map(() => queueWorker());
+    await Promise.all(workers);
+
+    // 4. Concatenate MP3 binary chunks into a single final playback stream
+    const finalBuffer = Buffer.concat(buffers);
+    console.log(`[Express Proxy Concatenation] Merged ${chunks.length} chunks into a single stream. Total size: ${finalBuffer.length} bytes`);
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', finalBuffer.length);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(finalBuffer);
+  } catch (err: any) {
+    console.error('[Express Proxy Global Error]:', err.message || err);
+    res.status(502).json({ error: err.message || 'Lỗi trong quá trình chia nhỏ và ghép dữ liệu giọng đọc' });
+  }
 });
 
 // Serve frontend assets in production or development
