@@ -1,0 +1,6 @@
+{
+  "name": "Text to Speech Studio",
+  "description": "Production-ready, highly-configurable Text to Speech reader that synthesizes audio from text with custom speed, pitch, voice filtering, and history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
