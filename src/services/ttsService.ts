@@ -79,136 +79,82 @@ export const SUPPORTED_VOICES: Voice[] = [
 ];
 
 export async function generateSpeech(text: string, voice: string): Promise<string> {
-  const encodedText = encodeURIComponent(text);
-  const directTtsUrl = `https://tts-voice-ai.onrender.com/tts?text=${encodedText}&voice=${voice}`;
-  const proxyTtsUrl = `/api/synthesize`;
+  const url = '/api/synthesize';
 
-  console.log(`[TTS Service] Starting speech generation for voice "${voice}"`);
+  console.log("TTS REQUEST URL:", url);
 
-  // We will try running a direct browser GET fetch with retry up to 3 times.
-  // If direct browser fetch fails (mostly due to CORS or Iframe sandboxing issues),
-  // we instantly fallback to our local companion Express proxy which bypasses CORS constraints.
-  let attempts = 3;
-  let lastError: any = null;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 seconds timeout
 
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 seconds timeout
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ text, voice }),
+      signal: controller.signal
+    });
 
-    try {
-      console.log(`[TTS Service Attempt ${attempt}] Request Method: GET`);
-      console.log(`[TTS Service Attempt ${attempt}] Request URL: ${directTtsUrl}`);
+    clearTimeout(timeoutId);
 
-      const response = await fetch(directTtsUrl, {
-        method: 'GET',
-        signal: controller.signal
-      });
+    console.log("TTS RESPONSE STATUS:", response.status);
 
-      clearTimeout(timeoutId);
+    const contentType = response.headers.get('content-type') || '';
 
-      // Extract details for logging
-      const statusCode = response.status;
-      const contentType = response.headers.get('content-type') || '';
-      
-      console.log(`[TTS Service Response Attempt ${attempt}] Status Code: ${statusCode}`);
-      console.log(`[TTS Service Response Attempt ${attempt}] Content-Type: ${contentType}`);
-      
-      // Log headers
-      const headersObj: Record<string, string> = {};
-      response.headers.forEach((val, key) => {
-        headersObj[key] = val;
-      });
-      console.log(`[TTS Service Response Attempt ${attempt}] Headers:`, JSON.stringify(headersObj, null, 2));
-
-      // 8. Chấp nhận thành công 200
-      if (statusCode === 200) {
-        if (!contentType.includes('audio')) {
-          if (contentType.includes('application/json')) {
-            const jsonText = await response.text();
-            console.log(`[TTS Service Error response body]:`, jsonText);
-            try {
-              const json = JSON.parse(jsonText);
-              throw new Error(json.error || json.message || 'Máy chủ phản hồi bằng dữ liệu JSON không chứa audio.');
-            } catch {
-              throw new Error(`Dữ liệu JSON thô: ${jsonText.slice(0, 150)}`);
-            }
+    if (response.status === 200) {
+      if (!contentType.includes('audio')) {
+        if (contentType.includes('application/json')) {
+          const bodyText = await response.text();
+          let parsedError = 'Nội dung phản hồi JSON không hợp lệ.';
+          try {
+            const bodyJson = JSON.parse(bodyText);
+            parsedError = bodyJson.error || bodyJson.message || bodyText;
+          } catch {
+            parsedError = bodyText;
           }
-          const textSample = await response.text().catch(() => '');
-          throw new Error(`Định dạng phản hồi không hợp lệ (${contentType}). Chi tiết: ${textSample.slice(0, 100)}`);
+          throw new Error(`[Lỗi máy chủ]: Phản hồi từ máy chủ chứa thông tin lỗi:\n- Kết quả: ${parsedError}`);
         }
-
-        const blob = await response.blob();
-        if (blob.size === 0) {
-          throw new Error('Độ dài file âm thanh bị rỗng (0 bytes).');
-        }
-
-        console.log(`[TTS Service Attempt ${attempt}] Success! Generated Blob size: ${blob.size} bytes`);
-        return URL.createObjectURL(blob);
-      } else {
-        // If status is not 200
         const bodyText = await response.text().catch(() => '');
-        console.error(`[TTS Service Attempt ${attempt} HTTP Error Body]:`, bodyText);
-        throw new Error(`Máy chủ báo lỗi HTTP ${statusCode}: ${bodyText.slice(0, 150)}`);
-      }
-    } catch (err: any) {
-      clearTimeout(timeoutId);
-      lastError = err;
-      console.warn(`[TTS Service Direct Attempt ${attempt} failed]:`, err.message || err);
-
-      // Detect "Failed to fetch" (usually CORS or network offline) or abort
-      const isFailedToFetch = err instanceof TypeError && err.message.toLowerCase().includes('failed to fetch');
-      const isCORSOrSandbox = isFailedToFetch || (err.message && err.message.includes('CORS'));
-
-      if (isCORSOrSandbox) {
-        console.log(`[TTS Service Fallback] Local server bypass triggers because of connection/CORS issue.`);
-        // Immediately try fallbacking to Express proxy server side
-        try {
-          console.log(`[TTS Service Proxy Call] Request Method: POST to ${proxyTtsUrl}`);
-          console.log(`[TTS Service Proxy Payload]:`, JSON.stringify({ text, voice }));
-
-          const proxyResponse = await fetch(proxyTtsUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ text, voice }),
-            signal: controller.signal
-          });
-
-          const pStatus = proxyResponse.status;
-          const pContentType = proxyResponse.headers.get('content-type') || '';
-
-          console.log(`[TTS Service Proxy Response] Status Code: ${pStatus}`);
-          console.log(`[TTS Service Proxy Response] Content-Type: ${pContentType}`);
-
-          if (pStatus === 200) {
-            const blob = await proxyResponse.blob();
-            console.log(`[TTS Service Proxy Success] Generated audio blob size: ${blob.size} bytes`);
-            return URL.createObjectURL(blob);
-          } else {
-            const pErrorText = await proxyResponse.text().catch(() => '');
-            console.error(`[TTS Service Proxy Error Body]:`, pErrorText);
-            try {
-              const pErrorJson = JSON.parse(pErrorText);
-              throw new Error(pErrorJson.error || pErrorJson.message || `Proxy báo lỗi mã ${pStatus}`);
-            } catch {
-              throw new Error(`Lỗi máy chủ proxy (${pStatus}): ${pErrorText.slice(0, 150)}`);
-            }
-          }
-        } catch (proxyErr: any) {
-          console.error(`[TTS Service Proxy Fallback also failed]:`, proxyErr.message || proxyErr);
-          lastError = proxyErr;
-        }
+        throw new Error(`[Lỗi định dạng]: Máy chủ không trả về âm thanh (Content-Type: ${contentType}).\nPhản hồi nhận được:\n${bodyText.slice(0, 200)}`);
       }
 
-      // If we are about to retry, add a small backoff delay to let Render wake up (free tier spinup time can be up to 30~50 seconds)
-      if (attempt < attempts) {
-        console.log(`[TTS Service] Waiting 2 seconds before retry attempt #${attempt + 1}...`);
-        await new Promise(resolve => setTimeout(resolve, 2000));
+      const blob = await response.blob();
+      if (blob.size === 0) {
+        throw new Error('Lỗi: Dữ liệu âm thanh nhận được bị rỗng (0 bytes). Trình duyệt không thể phát.');
       }
+
+      console.log(`[TTS Service] Tạo thành công! Kích thước: ${blob.size} bytes`);
+      return URL.createObjectURL(blob);
+    } else {
+      const bodyText = await response.text().catch(() => '');
+      throw new Error(
+        `Yêu cầu thiết lập âm thanh thất bại.\n` +
+        `- URL đã gọi: ${url}\n` +
+        `- Mã trạng thái (Status Code): ${response.status}\n` +
+        `- Chi tiết phản hồi (Response Body): ${bodyText || '(Rỗng)'}`
+      );
     }
-  }
+  } catch (err: any) {
+    clearTimeout(timeoutId);
 
-  // Handle errors elegantly
-  throw new Error(lastError?.message || 'Có lỗi xảy ra trong quá trình kết nối với hệ thống giọng đọc AI.');
+    if (err.name === 'AbortError') {
+      throw new Error(
+        `Không nhận được phản hồi (Quá hạn 60 giây).\n` +
+        `- URL đã gọi: ${url}\n` +
+        `- Chi tiết: Tiến trình bị hủy do vượt quá thời gian phản hồi quy định.`
+      );
+    }
+
+    // Pass through custom detailed errors
+    if (err.message && err.message.includes('URL đã gọi')) {
+      throw err;
+    }
+
+    throw new Error(
+      `Không thể hoàn thành yêu cầu (Lỗi kết nối hoặc chặn ứng dụng).\n` +
+      `- URL đã gọi: ${url}\n` +
+      `- Chi tiết lỗi: ${err.message || err}`
+    );
+  }
 }
